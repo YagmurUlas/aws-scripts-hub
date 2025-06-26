@@ -1,0 +1,83 @@
+name: Build and Deploy to Amazon ECR and Update ECS
+
+on:
+  push:
+    branches: [ "dev", "quality", "main" ]
+
+env:
+  ECR_NAME: example-ecr-repo-name
+  ECS_CLUSTER: example-ecs-cluster
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        role-session-name: github-actions-session
+
+    - name: Set environment variables based on branch
+      run: |
+        if [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
+          echo "ECS_SERVICE=dev-service" >> $GITHUB_ENV
+          echo "ECS_TASK_DEF=dev-task-def" >> $GITHUB_ENV
+          echo "IMAGE_TAG=dev" >> $GITHUB_ENV
+        elif [[ "${{ github.ref }}" == "refs/heads/quality" ]]; then
+          echo "ECS_SERVICE=quality-service" >> $GITHUB_ENV
+          echo "ECS_TASK_DEF=quality-task-def" >> $GITHUB_ENV
+          echo "IMAGE_TAG=quality" >> $GITHUB_ENV
+        elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          echo "ECS_SERVICE=prod-service" >> $GITHUB_ENV
+          echo "ECS_TASK_DEF=prod-task-def" >> $GITHUB_ENV
+          echo "IMAGE_TAG=prod" >> $GITHUB_ENV
+        fi
+
+    - name: Log in to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+      with:
+        mask-password: true
+
+    - name: Build images using Docker Compose
+      run: |
+        docker compose build
+
+    - name: Tag and push images to ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        SERVICES: "frontend_service backend_service db_service"
+      run: |
+        for SERVICE in $SERVICES; do
+          IMAGE_NAME="$ECR_REGISTRY/$ECR_NAME:${SERVICE}-${IMAGE_TAG}"
+          echo "Tagging and pushing $SERVICE as $IMAGE_NAME"
+          docker tag $SERVICE $IMAGE_NAME
+          docker push $IMAGE_NAME
+          docker image rm $IMAGE_NAME
+        done
+
+    - name: Deploy updated task to ECS
+      run: |
+        aws ecs update-service \
+          --cluster $ECS_CLUSTER \
+          --service $ECS_SERVICE \
+          --task-definition $ECS_TASK_DEF \
+          --force-new-deployment
+
+        echo "Waiting for ECS service to stabilize..."
+        aws ecs wait services-stable \
+          --cluster $ECS_CLUSTER \
+          --services $ECS_SERVICE
+
+        echo "Deployment completed."
